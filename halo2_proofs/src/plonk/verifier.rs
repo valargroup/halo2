@@ -18,6 +18,9 @@ mod batch;
 #[cfg(feature = "batch")]
 pub use batch::BatchVerifier;
 
+// Batch normalization costs more than individual normalization below this.
+const MIN_BATCH_NORMALIZE: usize = 4;
+
 fn commit_instance<C: CurveAffine>(params: &Params<C>, instance: &[C::Scalar]) -> C::Curve {
     let mut scalars = Vec::with_capacity(instance.len() + 1);
     scalars.extend(instance);
@@ -96,21 +99,50 @@ pub fn verify_proof<
         }
     }
 
-    let instance_commitments = instances
+    let max_instance_len = params.n as usize - (vk.cs.blinding_factors() + 1);
+    if instances
         .iter()
-        .map(|instance| {
-            instance
-                .iter()
-                .map(|instance| {
-                    if instance.len() > params.n as usize - (vk.cs.blinding_factors() + 1) {
-                        return Err(Error::InstanceTooLarge);
-                    }
+        .flat_map(|instance| instance.iter())
+        .any(|instance| instance.len() > max_instance_len)
+    {
+        return Err(Error::InstanceTooLarge);
+    }
 
-                    Ok(commit_instance(params, instance).to_affine())
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let num_instance_commitments = instances.len() * vk.cs.num_instance_columns;
+    let instance_commitments = if num_instance_commitments < MIN_BATCH_NORMALIZE {
+        instances
+            .iter()
+            .map(|instance| {
+                instance
+                    .iter()
+                    .map(|instance| commit_instance(params, instance).to_affine())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let instance_commitments_projective = instances
+            .iter()
+            .flat_map(|instance| instance.iter())
+            .map(|instance| commit_instance(params, instance))
+            .collect::<Vec<_>>();
+        let mut normalized_commitments = vec![C::identity(); instance_commitments_projective.len()];
+        C::Curve::batch_normalize(
+            &instance_commitments_projective,
+            &mut normalized_commitments,
+        );
+        let mut normalized_commitments = normalized_commitments.into_iter();
+        let instance_commitments = instances
+            .iter()
+            .map(|instance| {
+                normalized_commitments
+                    .by_ref()
+                    .take(instance.len())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        debug_assert!(normalized_commitments.next().is_none());
+        instance_commitments
+    };
 
     let num_proofs = instance_commitments.len();
 
