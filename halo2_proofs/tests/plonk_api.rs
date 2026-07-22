@@ -7,6 +7,8 @@ use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::circuit::{Cell, Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::dev::MockProver;
 use halo2_proofs::pasta::{Eq, EqAffine, Fp};
+#[cfg(feature = "unstable-verifier-fingerprint")]
+use halo2_proofs::plonk::fingerprint::{capture_proof_fingerprint, ChallengeRecorder};
 use halo2_proofs::plonk::{
     create_proof, keygen_pk, keygen_vk, verify_proof, Advice, Assigned, BatchVerifier, Circuit,
     Column, ConstraintSystem, Error, Fixed, SingleVerifier, TableColumn, VerificationStrategy,
@@ -552,6 +554,92 @@ fn plonk_api() {
                 &mut transcript,
             )
             .is_ok());
+        }
+
+        //
+        // Capture the verifier fingerprint (the assembled MSM) without treating capture as
+        // acceptance.
+        //
+
+        #[cfg(feature = "unstable-verifier-fingerprint")]
+        {
+            // Record the Fiat-Shamir challenges alongside the MSM, so an independent (Lean) model can
+            // assemble the same fingerprint at identical challenges.
+            let mut transcript = ChallengeRecorder::<_, _, Challenge255<_>>::init(&proof[..]);
+            let msm = capture_proof_fingerprint(
+                &params,
+                pk.get_vk(),
+                &[&[&pubinputs[..]], &[&pubinputs[..]]],
+                &mut transcript,
+            )
+            .expect("fingerprint capture should not fail");
+
+            // The verifier collapses its whole check into this one MSM (the fingerprint).
+            assert!(
+                !transcript.challenges.is_empty(),
+                "should record the verifier's Fiat-Shamir challenges"
+            );
+            eprintln!(
+                "captured verifier fingerprint with {} challenges",
+                transcript.challenges.len(),
+            );
+
+            // `plonk_api`'s selector columns `sa` and `sb` are assigned identically, so their fixed
+            // commitments coincide, and the two captured proofs share public inputs, so their
+            // instance commitments coincide too. Halo2's MSM merges these same-base terms while the
+            // Lean `assemble` does not, so no Lean-checkable fixture exists for this circuit: the
+            // exporter must reject the capture rather than emit a fixture whose `fingerprint_matches`
+            // can never hold. Reaching that guard also exercises every transcript-shape and
+            // squeeze-boundary assertion, which run first and must all pass.
+            let export_result = {
+                let prev_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {}));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pk.get_vk().dump_vesta_lean_fixture(
+                        "Halo2.Fixture.PlonkApi",
+                        "plonk_api",
+                        K,
+                        2,
+                        &transcript,
+                        &msm,
+                    )
+                }));
+                std::panic::set_hook(prev_hook);
+                result
+            };
+            let panic_msg = *export_result
+                .expect_err("exporter must reject a capture whose commitment bases coincide")
+                .downcast::<String>()
+                .expect("exporter guard panics with a formatted String message");
+            assert!(
+                panic_msg.contains("merging same-base terms or dropping identity bases"),
+                "exporter panicked for an unexpected reason: {panic_msg}"
+            );
+
+            // The captured MSM is exactly the verifier's accept check: the group identity for a valid
+            // proof (the same test `SingleVerifier` performs).
+            assert!(
+                msm.eval(),
+                "captured fingerprint must be the identity for a valid proof"
+            );
+
+            // A rejecting capture is checked only in Rust (it is never exported to Lean): verify the
+            // same proof bytes against the wrong public inputs. Every read still parses (the proof is
+            // unchanged), so capture succeeds, but the assembled MSM is non-identity.
+            let wrong_pubinputs = vec![instance + Fp::ONE];
+            let mut reject_transcript =
+                ChallengeRecorder::<_, _, Challenge255<_>>::init(&proof[..]);
+            let reject_msm = capture_proof_fingerprint(
+                &params,
+                pk.get_vk(),
+                &[&[&wrong_pubinputs[..]], &[&wrong_pubinputs[..]]],
+                &mut reject_transcript,
+            )
+            .expect("fingerprint capture should not fail for a parseable rejecting proof");
+            assert!(
+                !reject_msm.clone().eval(),
+                "captured fingerprint must be non-identity for an invalid proof"
+            );
         }
 
         //

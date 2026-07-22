@@ -133,33 +133,55 @@ impl<'a, C: CurveAffine> MSM<'a, C> {
         self.u_scalar = self.u_scalar.map(|a| a * &factor);
     }
 
+    /// The MSM's accumulated terms as borrowed views over the private fields: the `g_scalars`
+    /// (coefficients of the SRS generators `params.g`), `w_scalar` and `u_scalar` (coefficients of
+    /// `params.w` and `params.u`), and the `other` map of accumulated commitment terms. This is the
+    /// single source of truth for what this MSM represents; both [`eval`](Self::eval) and the
+    /// fingerprint export are defined in terms of it, so the exported view cannot drift from the
+    /// evaluated one. Returning borrows keeps `eval` — the production verifier hot path — free of the
+    /// `O(params.n)` `g_scalars` copy; only the (feature-gated) fingerprint export clones.
+    #[allow(clippy::type_complexity)]
+    fn terms(
+        &self,
+    ) -> (
+        Option<&[C::Scalar]>,
+        Option<C::Scalar>,
+        Option<C::Scalar>,
+        &BTreeMap<C::Base, (C::Scalar, C::Base)>,
+    ) {
+        (
+            self.g_scalars.as_deref(),
+            self.w_scalar,
+            self.u_scalar,
+            &self.other,
+        )
+    }
+
     /// Perform multiexp and check that it results in zero
     pub fn eval(self) -> bool {
-        let len = self.g_scalars.as_ref().map(|v| v.len()).unwrap_or(0)
-            + self.w_scalar.map(|_| 1).unwrap_or(0)
-            + self.u_scalar.map(|_| 1).unwrap_or(0)
-            + self.other.len();
+        let (g_scalars, w_scalar, u_scalar, other) = self.terms();
+
+        let len = g_scalars.map(<[_]>::len).unwrap_or(0)
+            + w_scalar.map(|_| 1).unwrap_or(0)
+            + u_scalar.map(|_| 1).unwrap_or(0)
+            + other.len();
         let mut scalars: Vec<C::Scalar> = Vec::with_capacity(len);
         let mut bases: Vec<C> = Vec::with_capacity(len);
 
-        scalars.extend(self.other.values().map(|(scalar, _)| scalar));
-        bases.extend(
-            self.other
-                .iter()
-                .map(|(x, (_, y))| C::from_xy(*x, *y).unwrap()),
-        );
+        scalars.extend(other.values().map(|(scalar, _)| *scalar));
+        bases.extend(other.iter().map(|(x, (_, y))| C::from_xy(*x, *y).unwrap()));
 
-        if let Some(w_scalar) = self.w_scalar {
+        if let Some(w_scalar) = w_scalar {
             scalars.push(w_scalar);
             bases.push(self.params.w);
         }
 
-        if let Some(u_scalar) = self.u_scalar {
+        if let Some(u_scalar) = u_scalar {
             scalars.push(u_scalar);
             bases.push(self.params.u);
         }
 
-        if let Some(g_scalars) = &self.g_scalars {
+        if let Some(g_scalars) = g_scalars {
             scalars.extend(g_scalars);
             bases.extend(self.params.g.iter());
         }
@@ -167,6 +189,29 @@ impl<'a, C: CurveAffine> MSM<'a, C> {
         assert_eq!(scalars.len(), len);
 
         bool::from(best_multiexp(&scalars, &bases).is_identity())
+    }
+
+    /// The MSM's accumulated terms, exposed for capturing the verifier fingerprint without consuming
+    /// it: the `g_scalars`, `w_scalar`, `u_scalar`, and the `other` terms as `(scalar, x, y)` for each
+    /// accumulated commitment point. Built from [`terms`](Self::terms) — the exact decomposition
+    /// [`eval`](Self::eval) evaluates — so the exported fingerprint is the evaluated view by
+    /// construction. The owned copies here are confined to this dev-only path.
+    #[cfg(feature = "unstable-verifier-fingerprint")]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn fingerprint_terms(
+        &self,
+    ) -> (
+        Option<Vec<C::Scalar>>,
+        Option<C::Scalar>,
+        Option<C::Scalar>,
+        Vec<(C::Scalar, C::Base, C::Base)>,
+    ) {
+        let (g_scalars, w_scalar, u_scalar, other) = self.terms();
+        let other = other
+            .iter()
+            .map(|(x, (scalar, y))| (*scalar, *x, *y))
+            .collect();
+        (g_scalars.map(<[_]>::to_vec), w_scalar, u_scalar, other)
     }
 }
 

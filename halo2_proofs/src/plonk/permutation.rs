@@ -75,6 +75,14 @@ pub(crate) struct VerifyingKey<C: CurveAffine> {
     commitments: Vec<C>,
 }
 
+impl<C: CurveAffine> VerifyingKey<C> {
+    /// The commitments to the permutation columns (one per column), for Lean fixture export.
+    #[cfg(feature = "unstable-verifier-fingerprint")]
+    pub(crate) fn commitments(&self) -> &[C] {
+        &self.commitments
+    }
+}
+
 /// The proving key for a single permutation argument.
 #[derive(Clone, Debug)]
 pub(crate) struct ProvingKey<C: CurveAffine> {
