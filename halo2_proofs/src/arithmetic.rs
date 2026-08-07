@@ -71,10 +71,19 @@ impl<C: CurveAffine> Buckets<C> {
         }
     }
 
-    fn sum(&mut self, coeffs: &[C::Scalar], bases: &[C], i: usize) -> C::Curve {
+    /// Accumulates the `i`-th window of a multiexponentiation into this set of
+    /// buckets. `reprs` holds the byte representation of each scalar, computed
+    /// once by the caller and reused across all windows (recomputing it per
+    /// window is a significant, and needless, cost in multiexp-heavy workloads).
+    fn sum(
+        &mut self,
+        reprs: &[<C::Scalar as PrimeField>::Repr],
+        bases: &[C],
+        i: usize,
+    ) -> C::Curve {
         // get segmentation and add coeff to buckets content
-        for (coeff, base) in coeffs.iter().zip(bases.iter()) {
-            let seg = self.get_at::<C::Scalar>(i, &coeff.to_repr());
+        for (repr, base) in reprs.iter().zip(bases.iter()) {
+            let seg = self.get_at(i, repr);
             if seg != 0 {
                 self.coeffs[seg - 1].add_assign(base);
             }
@@ -92,7 +101,7 @@ impl<C: CurveAffine> Buckets<C> {
         acc
     }
 
-    fn get_at<F: PrimeField>(&self, segment: usize, bytes: &F::Repr) -> usize {
+    fn get_at(&self, segment: usize, bytes: &<C::Scalar as PrimeField>::Repr) -> usize {
         let skip_bits = segment * self.c;
         let skip_bytes = skip_bits / 8;
 
@@ -151,6 +160,12 @@ pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cu
         (f64::from(bases.len() as u32)).ln().ceil() as usize
     };
 
+    // Precompute the byte representation of each scalar exactly once. The
+    // windowed (Pippenger) inner loop below reads every scalar once per window
+    // (roughly `256 / c` times); computing `to_repr` there instead would repeat
+    // an expensive Montgomery reduction for every window.
+    let reprs: Vec<_> = coeffs.iter().map(|a| a.to_repr()).collect();
+
     let mut multi_buckets: Vec<Buckets<C>> = vec![Buckets::new(c); (256 / c) + 1];
     let num_threads = multicore::current_num_threads();
     if coeffs.len() > num_threads {
@@ -159,7 +174,7 @@ pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cu
             .enumerate()
             .rev()
             .map(|(i, buckets)| {
-                let mut acc = buckets.sum(coeffs, bases, i);
+                let mut acc = buckets.sum(&reprs, bases, i);
                 (0..c * i).for_each(|_| acc = acc.double());
                 acc
             })
@@ -170,7 +185,7 @@ pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cu
             .iter_mut()
             .enumerate()
             .rev()
-            .map(|(i, buckets)| buckets.sum(coeffs, bases, i))
+            .map(|(i, buckets)| buckets.sum(&reprs, bases, i))
             .fold(C::Curve::identity(), |mut sum, bucket| {
                 // restore original evaluation point
                 (0..c).for_each(|_| sum = sum.double());

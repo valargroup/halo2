@@ -1,5 +1,6 @@
 use ff::Field;
 use group::Curve;
+use maybe_rayon::prelude::*;
 use rand_core::RngCore;
 use std::iter;
 use std::ops::RangeTo;
@@ -91,7 +92,7 @@ pub fn create_proof<
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let instance_commitments_projective: Vec<_> = instance_values
-                .iter()
+                .par_iter()
                 .map(|poly| params.commit_lagrange(poly, Blind::default()))
                 .collect();
             let mut instance_commitments =
@@ -105,7 +106,7 @@ pub fn create_proof<
             }
 
             let instance_polys: Vec<_> = instance_values
-                .iter()
+                .par_iter()
                 .map(|poly| {
                     let lagrange_vec = domain.lagrange_from_vec(poly.to_vec());
                     domain.lagrange_to_coeff(lagrange_vec)
@@ -113,7 +114,7 @@ pub fn create_proof<
                 .collect();
 
             let instance_cosets: Vec<_> = instance_polys
-                .iter()
+                .par_iter()
                 .map(|poly| domain.coeff_to_extended(poly.clone()))
                 .collect();
 
@@ -302,9 +303,13 @@ pub fn create_proof<
                 .iter()
                 .map(|_| Blind(C::Scalar::random(&mut rng)))
                 .collect();
+            // Commit to each advice column independently. At small `k` each MSM
+            // is tiny, so with many columns it is far more efficient to spread
+            // the columns across threads than to rely on the limited intra-MSM
+            // parallelism of a single small multiexp.
             let advice_commitments_projective: Vec<_> = advice
-                .iter()
-                .zip(advice_blinds.iter())
+                .par_iter()
+                .zip(advice_blinds.par_iter())
                 .map(|(poly, blind)| params.commit_lagrange(poly, *blind))
                 .collect();
             let mut advice_commitments = vec![C::identity(); advice_commitments_projective.len()];
@@ -316,14 +321,18 @@ pub fn create_proof<
                 transcript.write_point(*commitment)?;
             }
 
+            // Transform each advice column into coefficient form and then into
+            // the extended (coset) evaluation domain. These per-column FFTs are
+            // independent, so at small `k` (where each FFT is small) we get a
+            // near-linear speedup by parallelizing across columns rather than
+            // relying on the intra-FFT parallelism of each small transform.
             let advice_polys: Vec<_> = advice
-                .clone()
-                .into_iter()
-                .map(|poly| domain.lagrange_to_coeff(poly))
+                .par_iter()
+                .map(|poly| domain.lagrange_to_coeff(poly.clone()))
                 .collect();
 
             let advice_cosets: Vec<_> = advice_polys
-                .iter()
+                .par_iter()
                 .map(|poly| domain.coeff_to_extended(poly.clone()))
                 .collect();
 
