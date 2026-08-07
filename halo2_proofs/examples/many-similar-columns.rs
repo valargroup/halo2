@@ -82,13 +82,23 @@ impl<F: Field> Circuit<F> for ManyColsCircuit<F> {
     ) -> Result<(), Error> {
         let n = 1usize << self.k;
         // Leave room for blinding rows.
-        let usable = n - 10;
+        let max_usable = n - 10;
+        // Number of rows actually filled with witness per column (rest stay
+        // zero). `ROWS` lets us study how MSM cost tracks the *used* rows at a
+        // fixed domain size `k`.
+        let usable = std::env::var("ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(max_usable)
+            .min(max_usable);
 
         layouter.assign_region(
             || "fill",
             |mut region| {
-                // Enable the selector on all-but-last usable row.
-                for row in 0..usable - 1 {
+                // Enable the selector only where the squaring chain is valid.
+                // On rows outside [0, usable) advice is zero and the selector is
+                // off, so the gate holds trivially.
+                for row in 0..usable.saturating_sub(1) {
                     region.assign_fixed(|| "s", config.selector, row, || Value::known(F::ONE))?;
                 }
 
